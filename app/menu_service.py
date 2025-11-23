@@ -1,19 +1,4 @@
-#TraceID menu_service.py
-
-
-
 # app/menu_service.py
-"""
-Menu Service – Upgraded Version
-Aligned with MCP Adapter v1.1 and MCP Orchestrator v1.1
-
-Key Enhancements:
-- Full trace_id propagation (end-to-end observability)
-- Structured Loki logging
-- Robust error handling with latency measurement
-- Same functional contract (backward compatible)
-- Microservice-safe return types
-"""
 
 import os
 import time
@@ -27,90 +12,138 @@ from .logging_loki import loki
 MENU_SERVICE_URL = os.getenv("MENU_SERVICE_URL")
 
 
-def get_menu(
-    user_id: str,
-    channel: str,
-    session_id: str,
-    trace_id: Optional[str] = None
-) -> Dict[str, Any]:
+def get_menu(user_id: str, channel: str, session_id: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Fetch menu data from the external Menu Microservice.
+    Fetch the restaurant menu from an external service (n8n webhook).
 
-    Args:
-        user_id: ID of the user making the request
-        channel: Channel (web, voice, WhatsApp, etc.)
-        session_id: Orchestrator session id
-        trace_id: End-to-end trace identifier for observability (optional)
+    NORMALIZATION RULES (PRESERVED FROM OLD SCRIPT):
 
-    Returns:
-        A dict containing menu data.
-        Returns {} on failure.
+    Raw n8n shape:
+      [
+        {
+          "output": { "text": "Pepperoni - Pizza - 100\n..." }
+        }
+      ]
+
+    Normalized:
+      {
+        "output": "Pepperoni - Pizza - 100\n..."
+      }
+
+    Also supports:
+      {
+         "output": "Some string"
+      }
     """
 
-    start_time = time.perf_counter()
-
+    # Missing configuration
     if not MENU_SERVICE_URL:
         loki.log(
-            "error",
+            "warning",
             {
-                "event_type": "service_error",
+                "event_type": "service_missing_config",
+                "detail": "MENU_SERVICE_URL not set",
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
-                "error": "MENU_SERVICE_URL not configured"
             },
             service_type="menu_service",
             sync_mode="async",
             io="none",
-            trace_id=trace_id
+            trace_id=trace_id,
         )
         return {}
 
+    start = time.perf_counter()
+
+    # ---- OUTGOING CALL LOG (async OUT) ----
+    loki.log(
+        "info",
+        {
+            "event_type": "service_call",
+            "reason": "get_menu",
+            "user": user_id,
+            "channel": channel,
+            "session_id": session_id,
+        },
+        service_type="menu_service",
+        sync_mode="async",
+        io="out",
+        trace_id=trace_id,
+    )
+
     try:
-        response = requests.get(MENU_SERVICE_URL, timeout=5)
-        response.raise_for_status()
+        resp = requests.get(MENU_SERVICE_URL, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
 
-        latency_ms = round((time.perf_counter() - start_time) * 1000, 3)
+        # ---------------------------------------------------
+        # NORMALIZATION STEP (IDENTICAL TO OLD VERSION)
+        # ---------------------------------------------------
 
+        # If list, take first element
+        if isinstance(data, list) and data:
+            first = data[0]
+        else:
+            first = data
+
+        # Expect dict with "output"
+        if isinstance(first, dict):
+            out = first.get("output")
+        else:
+            out = None
+
+        # Flatten { "text": "..." }
+        if isinstance(out, dict) and isinstance(out.get("text"), str):
+            normalized = {"output": out["text"]}
+
+        # Already string
+        elif isinstance(out, str):
+            normalized = {"output": out}
+
+        # Unknown shape
+        else:
+            normalized = {}
+
+        latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
+
+        # ---- INCOMING RESPONSE LOG (async IN) ----
         loki.log(
             "info",
             {
-                "event_type": "service_called",
-                "service": "menu_service",
+                "event_type": "service_return",
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
                 "latency_ms": latency_ms,
-                "status": "success",
-                "http_status": response.status_code
+                "raw_shape": type(data).__name__,
             },
             service_type="menu_service",
             sync_mode="async",
-            io="out",
-            trace_id=trace_id
+            io="in",
+            trace_id=trace_id,
         )
 
-        # Convert JSON to dict (safe)
-        return response.json() if response.content else {}
+        return normalized
 
     except Exception as e:
-        latency_ms = round((time.perf_counter() - start_time) * 1000, 3)
+        latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
+        # ---- ERROR LOG ----
         loki.log(
             "error",
             {
                 "event_type": "service_error",
-                "service": "menu_service",
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
                 "latency_ms": latency_ms,
-                "error": str(e)
+                "error": str(e),
             },
             service_type="menu_service",
             sync_mode="async",
             io="none",
-            trace_id=trace_id
+            trace_id=trace_id,
         )
 
         return {}
