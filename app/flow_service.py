@@ -1,30 +1,28 @@
-#TraceID flow_service.py
-
 # app/flow_service.py
-"""
-Flow Service – Upgraded Version
-Aligned with MCP Adapter v1.1 and MCP Orchestrator v1.1
 
-Key Enhancements:
-- Full trace_id propagation
-- Unified logging via Loki
-- Microservice-safe structure
-- Backwards-compatible API
-"""
+from __future__ import annotations
 
-from typing import Optional, Dict, Any
-from datetime import datetime, timezone
 import time
+from typing import Optional
+
+from pydantic import BaseModel
 
 from .logging_loki import loki
-from .menu_service import get_menu
+from .menu_service import get_menu  # renamed from fetch_menu in the upgraded menu_service
 
 
-class FlowResult:
-    def __init__(self, reply_text: str, route: str):
-        self.reply_text = reply_text
-        self.route = route
+# ------------------------------------------------------
+# FlowServiceResult model
+# ------------------------------------------------------
 
+class FlowServiceResult(BaseModel):
+    reply_text: str
+    route: str   # which microservice or flow handled the request
+
+
+# ------------------------------------------------------
+# Main Flow Service Logic
+# ------------------------------------------------------
 
 def run_flow(
     intent: str,
@@ -32,97 +30,167 @@ def run_flow(
     user_id: str,
     channel: str,
     session_id: str,
-    trace_id: Optional[str] = None
-) -> FlowResult:
+    trace_id: Optional[str] = None,
+) -> FlowServiceResult:
     """
-    Main flow router for all domain-specific logic.
+    Flow Service = domain orchestration layer.
 
-    Args:
-        intent: classified intent
-        text: user text from orchestrator
-        user_id: id of user
-        channel: origin channel
-        session_id: orchestrator session
-        trace_id: end-to-end tracing id
+    Responsibilities:
+      - Route by INTENT (determined by intent_service.py)
+      - Call correct microservice(s)
+      - Assemble final reply_text
+      - Handle business logic OUTSIDE of MCP
 
-    Returns:
-        FlowResult
+    The orchestrator simply calls `run_flow()` and returns the result.
     """
 
-    start = time.perf_counter()
+    # Log start of flow handling
+    loki.log(
+        "info",
+        {
+            "event_type": "flow_start",
+            "intent": intent,
+            "user": user_id,
+            "channel": channel,
+            "session_id": session_id,
+        },
+        service_type="flow_service",
+        sync_mode="sync",
+        io="in",
+        trace_id=trace_id,
+    )
 
-    try:
-        # Example routing (extendable)
-        if intent == "get_menu":
-            menu = get_menu(user_id, channel, session_id, trace_id)
-            reply = _format_menu(menu)
-            route = "food_ordering.menu"
+    # ======================================================
+    #  INTENT → FLOW ROUTING
+    # ======================================================
 
-        else:
-            reply = "I’m not sure how to help with that right now."
-            route = "fallback.unknown"
-
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
+    # 1. MENU FLOW
+    if intent == "menu":
+        start = time.perf_counter()
 
         loki.log(
             "info",
             {
-                "event_type": "flow_output",
+                "event_type": "flow_menu_call",
                 "intent": intent,
-                "route": route,
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
-                "latency_ms": latency_ms,
+                "message": "calling menu_service",
             },
             service_type="flow_service",
             sync_mode="async",
             io="out",
-            trace_id=trace_id
+            trace_id=trace_id,
         )
 
-        return FlowResult(reply_text=reply, route=route)
+        # Call external microservice
+        menu_payload = get_menu(
+            user_id=user_id,
+            channel=channel,
+            session_id=session_id,
+            trace_id=trace_id,
+        )
 
-    except Exception as e:
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
+        latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
+        # Extract human-readable menu
+        reply_text = _extract_menu_text(menu_payload)
+
+        # Log return from menu_service
         loki.log(
-            "error",
+            "info",
             {
-                "event_type": "flow_error",
+                "event_type": "flow_menu_return",
                 "intent": intent,
+                "latency_ms": latency_ms,
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
-                "latency_ms": latency_ms,
-                "error": str(e)
+                "payload_received": bool(menu_payload),
             },
             service_type="flow_service",
             sync_mode="async",
-            io="none",
-            trace_id=trace_id
+            io="in",
+            trace_id=trace_id,
         )
 
-        return FlowResult(
-            reply_text="There was an issue processing your request.",
-            route="system.error"
-        )
+        if not reply_text:
+            reply_text = (
+                "I tried to fetch the menu but didn't receive any usable data. "
+                "Please try again in a moment."
+            )
+
+        # Keep the original route value for compatibility
+        return FlowServiceResult(reply_text=reply_text, route="menu")
+
+    # ======================================================
+    #  UNKNOWN / DEFAULT FLOW
+    # ======================================================
+
+    reply_text = (
+        "I can help you by getting the menu. "
+        "Try saying something like: 'Get the menu'.\n\n"
+        f"(You said: {text})"
+    )
+
+    loki.log(
+        "info",
+        {
+            "event_type": "flow_fallback",
+            "intent": intent,
+            "user": user_id,
+            "channel": channel,
+            "session_id": session_id,
+        },
+        service_type="flow_service",
+        sync_mode="sync",
+        io="none",
+        trace_id=trace_id,
+    )
+
+    return FlowServiceResult(reply_text=reply_text, route="fallback")
 
 
-def _format_menu(menu: Dict[str, Any]) -> str:
-    """
-    Helper to create readable menu text.
-    """
-    if not menu:
-        return "Menu is temporarily unavailable."
+# ------------------------------------------------------
+# Helper: Convert menu_payload into readable text
+# ------------------------------------------------------
 
-    if "items" not in menu:
-        return "Menu format error."
+def _extract_menu_text(menu_payload: dict) -> str:
+    """Reusable version of menu formatting."""
 
-    lines = ["Here is the menu:"]
-    for item in menu["items"]:
-        name = item.get("name", "Unknown")
-        price = item.get("price", "N/A")
-        lines.append(f"- {name} – {price}")
+    if not isinstance(menu_payload, dict):
+        return ""
 
-    return "\n".join(lines)
+    # AI-style text response
+    if isinstance(menu_payload.get("output"), str):
+        return menu_payload["output"].strip()
+
+    # Explicit key "menu"
+    if isinstance(menu_payload.get("menu"), str):
+        return menu_payload["menu"].strip()
+
+    # Structured category list
+    if "categories" in menu_payload:
+        try:
+            lines = []
+            for c in menu_payload["categories"]:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("name", "Category")
+                items = c.get("items") or []
+                item_names = ", ".join(
+                    i.get("name", "") for i in items if isinstance(i, dict)
+                )
+                if item_names:
+                    lines.append(f"{name}: {item_names}")
+                else:
+                    lines.append(name)
+
+            if lines:
+                return "Here is the menu:\n" + "\n".join(lines)
+
+        except Exception:
+            return ""
+
+    return ""
