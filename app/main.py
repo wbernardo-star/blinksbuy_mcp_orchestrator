@@ -1,5 +1,3 @@
-#FLOWSERVICE app/main.py
-
 # app/main.py
 from __future__ import annotations
 
@@ -12,7 +10,7 @@ from pydantic import BaseModel
 
 from .logging_loki import loki
 from .intent_service import classify_intent
-from .flow_service import run_flow   # ← NEW: flow microservice orchestrator
+from .flow_service import run_flow   # ← flow microservice orchestrator
 
 
 # ------------------------------------------------------
@@ -24,6 +22,8 @@ class OrchestrateRequest(BaseModel):
     user_id: str
     channel: str = "web"
     session_id: Optional[str] = None
+    # NEW: trace_id from adapter / client
+    trace_id: Optional[str] = None
 
 
 class OrchestrateResponse(BaseModel):
@@ -33,6 +33,8 @@ class OrchestrateResponse(BaseModel):
     route: str
     intent: str
     intent_confidence: float
+    # Optional echo of trace_id for debugging (doesn’t affect adapter)
+    trace_id: Optional[str] = None
 
 
 # ------------------------------------------------------
@@ -70,6 +72,7 @@ def health_check():
         service_type="orchestrator",
         sync_mode="sync",
         io="none",
+        # trace_id omitted here on purpose
     )
     return {"status": "ok", "service": "mcp_orchestrator_thin"}
 
@@ -83,6 +86,9 @@ def orchestrate(req: OrchestrateRequest):
 
     start = time.perf_counter()
 
+    # Pull trace_id from request (adapter sends this)
+    trace_id = req.trace_id
+
     # ------------------------------
     #  SESSION MANAGEMENT
     # ------------------------------
@@ -94,12 +100,14 @@ def orchestrate(req: OrchestrateRequest):
     # ------------------------------
     #  INTENT CLASSIFICATION (LLM)
     # ------------------------------
+    # If your classify_intent() does NOT yet accept trace_id, remove trace_id=trace_id.
     intent_result = classify_intent(
         text=req.text,
         user_id=req.user_id,
         channel=req.channel,
         session_id=session_id,
         history=None,  # optional future
+        trace_id=trace_id,  # NEW (safe if function signature supports it)
     )
     intent = intent_result.intent
     confidence = intent_result.confidence
@@ -122,18 +130,21 @@ def orchestrate(req: OrchestrateRequest):
         service_type="orchestrator",
         sync_mode="sync",
         io="in",
+        trace_id=trace_id,  # NEW
     )
 
     # ------------------------------
     #  FLOW SERVICE (Domain Logic)
     # ------------------------------
     try:
+        # If your run_flow() does NOT yet accept trace_id, remove trace_id=trace_id.
         flow_result = run_flow(
             intent=intent,
             text=req.text,
             user_id=req.user_id,
             channel=req.channel,
             session_id=session_id,
+            trace_id=trace_id,  # NEW
         )
 
         reply_text = flow_result.reply_text
@@ -161,6 +172,7 @@ def orchestrate(req: OrchestrateRequest):
             service_type="orchestrator",
             sync_mode="sync",
             io="out",
+            trace_id=trace_id,  # NEW
         )
 
         return OrchestrateResponse(
@@ -170,6 +182,7 @@ def orchestrate(req: OrchestrateRequest):
             route=route,
             intent=intent,
             intent_confidence=confidence,
+            trace_id=trace_id,  # optional echo
         )
 
     except Exception as e:
@@ -194,6 +207,7 @@ def orchestrate(req: OrchestrateRequest):
             service_type="orchestrator",
             sync_mode="sync",
             io="none",
+            trace_id=trace_id,  # NEW
         )
 
-        raise HTTPException(status_code=500, detail="Internal error in orchestrator")# main orchestrator code placeholder
+        raise HTTPException(status_code=500, detail="Internal error in orchestrator")
